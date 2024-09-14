@@ -20,6 +20,12 @@ struct TokenizedInputs {
     ov::Tensor attention_mask;
 };
 
+struct TokenizedEmbeddedInputs {
+    ov::Tensor input_ids;
+    ov::Tensor attention_mask;
+    ov::Tensor input_embeds;
+};
+
 /**
 * @brief class is used to encode prompts and decode resulting tokens
 */

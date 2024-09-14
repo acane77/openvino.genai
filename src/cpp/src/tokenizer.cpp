@@ -9,6 +9,7 @@
 #include <jinja2cpp/user_callable.h>
 #include "tokenizers_path.hpp"
 #include "circular_buffer_queue.hpp"
+#include "openvino/frontend/hash_table.hpp"
 #include <fstream>
 #include <memory>
 
