@@ -11,6 +11,7 @@
 
 #include "openvino/genai/llm_pipeline.hpp"
 #include "utils.hpp"
+#include "openvino/genai/embedding_streamer.hpp"
 
 
 namespace {
@@ -151,6 +152,7 @@ namespace genai {
 
 ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner,
                                                 ov::Tensor input_ids,
+                                                const ov::Tensor* input_embeds,
                                                 ov::Tensor attention_mask,
                                                 ov::genai::GenerationConfig config,
                                                 std::shared_ptr<ov::genai::StreamerBase> streamer,
@@ -160,7 +162,8 @@ ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner
 
     OPENVINO_ASSERT(batch_size == 1, "Only batch size = 1 supported for multinomial decoding");
 
-    size_t prompt_len = prompts_shape[1];
+    const size_t prompt_len = prompts_shape[1];
+    const size_t max_new_tokens = config.get_max_new_tokens(prompt_len);
 
     // Initialize results and performance metrics.
     EncodedResults results;
@@ -169,7 +172,17 @@ ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner
     results.tokens.resize(batch_size);
 
     // Initialize inputs
-    m_model_runner.set_tensor("input_ids", input_ids);
+    if (input_embeds == nullptr) {
+        // printf("multinomial_decoding.cpp:187 before set input_ids\n");
+        m_model_runner.set_tensor("input_ids", input_ids);
+    }
+    else {
+        // printf("multinomial_decoding.cpp:193 before set inputs_embeds, elem_type is %d\n",
+        //     input_embeds->get_element_type());
+        m_model_runner.set_tensor("inputs_embeds", *input_embeds);
+    }
+    // printf("multinomial_decoding.cpp:187 before set attention_mask tensor, elem_type is %d\n",
+    //     attention_mask.get_element_type());
     m_model_runner.set_tensor("attention_mask", attention_mask);
     
     if (position_ids.has_value())
@@ -211,9 +224,13 @@ ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner
         return results;
     }
 
-    m_model_runner.get_tensor("input_ids").set_shape({batch_size, 1});
-
-    size_t max_new_tokens = config.get_max_new_tokens(prompt_len);
+    //printf("multinomial_decoding.cpp:242 before set tensor\n");
+    if (input_embeds == nullptr) {
+        m_model_runner.get_tensor("input_ids").set_shape({batch_size, 1});
+    }
+    else {
+        m_model_runner.get_tensor("inputs_embeds").set_shape({batch_size, 1, input_embeds->get_shape()[2]});
+    }
 
     for (size_t i = 0; i < max_new_tokens - 1; i++) {
         if (position_ids.has_value()) {
@@ -223,7 +240,28 @@ ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner
         m_model_runner.set_tensor("attention_mask",
                                   ov::genai::utils::extend_attention(m_model_runner.get_tensor("attention_mask")));
 
-        m_model_runner.get_tensor("input_ids").data<int64_t>()[0] = out_token.id;
+        if (input_embeds == nullptr) {
+            m_model_runner.get_tensor("input_ids").data<int64_t>()[0] = out_token.id;
+        }
+        else {
+            auto input_emb_data_type = input_embeds->get_element_type();
+            auto input_emb_shape = input_embeds->get_shape();
+            size_t data_size = input_emb_data_type.size() * input_emb_shape[2];
+            void* interm_input_emb_data = m_model_runner.get_tensor("inputs_embeds").data();
+            std::shared_ptr<EmbeddingStreamer> embedding_streamer = std::dynamic_pointer_cast<EmbeddingStreamer>(streamer);
+            if (embedding_streamer == nullptr) {
+                OPENVINO_THROW("for input_embeds as input, must use EmbeddingStreamer as stream");
+            }
+            //printf("---> get embedding start, token = %ld\n", out_token.id);
+            ov::Tensor out_tok_embedding = embedding_streamer->get_embedding(out_token.id);
+            //printf("---> get embedding end, token = %ld, |embedding| = %zd\n",
+            //    out_token.id, out_tok_embedding.get_size());
+            if (out_tok_embedding.get_size() != input_emb_shape[2]) {
+                OPENVINO_THROW("embedding data size is not expected.  "
+                               "real:", out_tok_embedding.get_size(), "  expected:", input_emb_shape[2]);
+            }
+            memcpy(interm_input_emb_data, out_tok_embedding.data(), data_size);
+        }
 
         m_model_runner.infer();
         raw_perf_counters.m_new_token_times.emplace_back(std::chrono::steady_clock::now());

@@ -48,7 +48,8 @@ ov::genai::EncodedResults greedy_decoding(
 
 ov::genai::EncodedResults multinominal_decoding(
     ov::InferRequest& model_runner,
-    ov::Tensor prompts,
+    ov::Tensor input_ids,
+    const ov::Tensor* input_embeds,
     ov::Tensor attention_mask,
     GenerationConfig sampling_params,
     std::shared_ptr<StreamerBase> streamer,
@@ -172,6 +173,8 @@ public:
         raw_counters.tokenization_durations.emplace_back(PerfMetrics::get_microsec(encode_stop_time - start_time));
         raw_counters.detokenization_durations.emplace_back(PerfMetrics::get_microsec(decode_stop_time - decode_start_time));
 
+        // Added tokenization/detokenization times, and updated generate duration, need to reevaluate statistics.
+        decoded_results.perf_metrics.m_evaluated = false;
         decoded_results.perf_metrics.evaluate_statistics(start_time);
         return decoded_results;
     }
@@ -183,13 +186,31 @@ public:
     ) override {
         auto start_time = std::chrono::steady_clock::now();
         ov::Tensor input_ids;
+        std::unique_ptr<ov::Tensor> input_embeds = nullptr;
         ov::Tensor attention_mask;
         if (auto data = std::get_if<ov::Tensor>(&inputs)) {
             input_ids = *data;
-            attention_mask = ov::genai::utils::init_attention_mask(input_ids);
+            attention_mask = ov::genai::utils::init_attention_mask(*data);
         } else if (auto data = std::get_if<TokenizedInputs>(&inputs)) {
             input_ids = data->input_ids;
             attention_mask = data->attention_mask;
+        }
+        else if (auto data = std::get_if<TokenizedEmbeddedInputs>(&inputs)) {
+            //printf(">>> input as TokenizedEmbeddedInputs\n");
+            input_ids = data->input_ids;
+            attention_mask = data->attention_mask;
+            input_embeds = std::make_unique<ov::Tensor>(data->input_embeds);
+            auto input_ids_shape = input_ids.get_shape();
+            auto input_embeds_shape = input_embeds->get_shape();
+            if (input_ids_shape.size() != input_embeds_shape.size() - 1) {
+                OPENVINO_THROW("unexpected id and embedding pair, id shape is ", input_ids_shape.size(),
+                    " embedding shape is ", input_embeds_shape.size());
+            }
+            for (int i=0; i<input_ids_shape.size(); i++) {
+                if (input_ids_shape[i] != input_embeds_shape[i]) {
+                    OPENVINO_THROW("size on dimension ", i, " does not match, id:", input_ids_shape[i], " embedding:", input_embeds_shape[i]);
+                }
+            }
         }
 
         GenerationConfig config = (generation_config.has_value()) ? *generation_config : m_generation_config;
@@ -251,15 +272,19 @@ public:
 
         ov::genai::EncodedResults result;
         if (config.is_greedy_decoding()) {
-            result = ov::genai::greedy_decoding(m_model_runner, input_ids, concatenated_attention_mask, 
+            OPENVINO_ASSERT(input_ids, "Only support input_ids as input tensor for now");
+            result = ov::genai::greedy_decoding(m_model_runner, input_ids, concatenated_attention_mask,
                                                 config, streamer_ptr, position_ids);
             m_selected_beam = 0;
         } else if (config.is_beam_search()) {
-            std::tie(result, m_selected_beam) = beam_search(m_model_runner, input_ids, concatenated_attention_mask, 
+            OPENVINO_ASSERT(input_ids, "Only support input_ids as input tensor for now");
+            std::tie(result, m_selected_beam) = beam_search(m_model_runner, input_ids, concatenated_attention_mask,
                                                             config, position_ids, m_selected_beam);
         } else if (config.is_multinomial()) {
-            result = multinominal_decoding(m_model_runner, input_ids, concatenated_attention_mask, 
-                                           config, streamer_ptr, position_ids);
+            //printf("llm_pipeline.cpp:294 before multinominal_decoding\n");
+            result = multinominal_decoding(m_model_runner, input_ids, input_embeds.get(),
+                                            concatenated_attention_mask, config, streamer_ptr, position_ids);
+            //printf("llm_pipeline.cpp:297 after multinominal_decoding\n");
             m_selected_beam = 0;
         } else {
             OPENVINO_THROW("No decoding algorithm found for provided configuration parameters.");
@@ -275,7 +300,12 @@ public:
 
         // If is called without tokenization then that stat will not be reported.
         auto& metrics = result.perf_metrics;
-        metrics.num_input_tokens = batch_size * input_ids.get_shape().at(1);
+        if (input_ids) {
+            metrics.num_input_tokens = batch_size * input_ids.get_shape().at(1);
+        }
+        else if (input_embeds) {
+            metrics.num_input_tokens = batch_size * input_embeds->get_shape().at(1);
+        }
         metrics.load_time = this->m_load_time_ms;
         metrics.raw_metrics.generate_durations.emplace_back(PerfMetrics::get_microsec(stop_time - start_time));
         metrics.evaluate_statistics(start_time);
@@ -478,6 +508,26 @@ public:
                     input_ids.back().set_shape({1, copy_count});
                 }
                 return input_ids;
+            },
+            [](const TokenizedEmbeddedInputs& inp) {
+                size_t batch_size = inp.input_ids.get_shape().at(0);
+                std::vector<ov::Tensor> input_ids;
+                input_ids.reserve(batch_size);
+                size_t max_len = inp.input_ids.get_shape().at(1);
+                const int64_t* const source = inp.input_ids.data<const int64_t>();
+                const int64_t* const attention_mask = inp.attention_mask.data<const int64_t>();
+                for (size_t batch_id = 0; batch_id < batch_size; ++batch_id) {
+                    input_ids.emplace_back(ov::element::i64, ov::Shape(1, max_len));
+                    int64_t* destination = input_ids.back().data<int64_t>();
+                    size_t copy_count = 0;
+                    for (size_t idx = 0; idx < max_len; ++idx) {
+                        if (1 == attention_mask[batch_id * max_len + idx]) {
+                            destination[copy_count++] = source[batch_id * max_len + idx];
+                        }
+                    }
+                    input_ids.back().set_shape({1, copy_count});
+                }
+                return input_ids;
             }
         }, inputs);
         const GenerationConfig& config = generation_config.has_value() ? *generation_config : m_generation_config;
@@ -522,7 +572,7 @@ ov::genai::LLMPipeline::LLMPipeline(
     const std::string& device,
     const ov::AnyMap& plugin_config
 ){
-    auto start_time = std::chrono::steady_clock::now();    
+    auto start_time = std::chrono::steady_clock::now();
     if ("CB" == device) {
         m_pimpl = std::make_unique<ContinuousBatchingAdapter>(model_path, tokenizer, "CPU", plugin_config);
     } else if ("NPU" == device) {
@@ -538,7 +588,7 @@ ov::genai::LLMPipeline::LLMPipeline(
     const std::string& path,
     const std::string& device,
     const ov::AnyMap& config
-){ 
+){
     auto start_time = std::chrono::steady_clock::now();
     if ("CB" == device) {
         m_pimpl = std::make_unique<ContinuousBatchingAdapter>(path, "CPU", config);
