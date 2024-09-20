@@ -184,15 +184,13 @@ ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner
     // printf("multinomial_decoding.cpp:187 before set attention_mask tensor, elem_type is %d\n",
     //     attention_mask.get_element_type());
     m_model_runner.set_tensor("attention_mask", attention_mask);
-    
+
     if (position_ids.has_value())
         m_model_runner.set_tensor("position_ids", *position_ids);
-    
     // Input values are persistent between inference calls.
     // That allows to set values, which aren't going to change, only once
     m_model_runner.get_tensor("beam_idx").set_shape({batch_size});
     m_model_runner.get_tensor("beam_idx").data<int32_t>()[0] = 0;
-
     m_model_runner.infer();
     raw_perf_counters.m_new_token_times.emplace_back(std::chrono::steady_clock::now());
     raw_perf_counters.m_batch_sizes.emplace_back(batch_size);
@@ -289,5 +287,51 @@ ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner
 
     return results;
 }
+
+ov::genai::EncodedResults prefill(ov::InferRequest& m_model_runner,
+                                  ov::Tensor input_ids,
+                                  const ov::Tensor* input_embeds,
+                                  ov::Tensor attention_mask,
+                                  std::optional<ov::Tensor> position_ids) {
+    ov::Shape prompts_shape = input_ids.get_shape();
+    size_t batch_size = prompts_shape[0];
+    OPENVINO_ASSERT(batch_size == 1, "Only batch size = 1 supported for prefill");
+    const size_t prompt_len = prompts_shape[1];
+
+    // Initialize results and performance metrics.
+    EncodedResults results;
+    auto& raw_perf_counters = results.perf_metrics.raw_metrics;
+    results.scores.clear();
+    results.tokens.clear();
+
+    // Initialize inputs
+    if (input_embeds == nullptr) {
+        // printf("multinomial_decoding.cpp:187 before set input_ids\n");
+        m_model_runner.set_tensor("input_ids", input_ids);
+    }
+    else {
+        // printf("multinomial_decoding.cpp:193 before set inputs_embeds, elem_type is %d\n",
+        //     input_embeds->get_element_type());
+        m_model_runner.set_tensor("inputs_embeds", *input_embeds);
+    }
+
+    // printf("multinomial_decoding.cpp:187 before set attention_mask tensor, elem_type is %d\n",
+    //     attention_mask.get_element_type());
+    m_model_runner.set_tensor("attention_mask", attention_mask);
+
+    if (position_ids.has_value())
+        m_model_runner.set_tensor("position_ids", *position_ids);
+
+    // Input values are persistent between inference calls.
+    // That allows to set values, which aren't going to change, only once
+    m_model_runner.get_tensor("beam_idx").set_shape({batch_size});
+    m_model_runner.get_tensor("beam_idx").data<int32_t>()[0] = 0;
+    m_model_runner.infer();
+    raw_perf_counters.m_new_token_times.emplace_back(std::chrono::steady_clock::now());
+    raw_perf_counters.m_batch_sizes.emplace_back(batch_size);
+
+    return results;
+}
+
 }  // namespace genai
 }  // namespace ov

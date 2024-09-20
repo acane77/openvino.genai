@@ -29,6 +29,11 @@ public:
         StreamerVariant streamer
     ) = 0;
 
+    virtual EncodedResults prefill(const EncodedInputs& inputs) {
+        OPENVINO_THROW("Unimplemented prefill");
+        return {};
+    }
+
     virtual void start_chat(const std::string& system_message) = 0;
     virtual void finish_chat() = 0;
 

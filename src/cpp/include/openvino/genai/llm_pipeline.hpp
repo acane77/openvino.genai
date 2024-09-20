@@ -184,6 +184,8 @@ public:
         return generate(inputs, AnyMap{std::forward<Properties>(properties)...});
     }
 
+    EncodedResults prefill(const EncodedInputs& inputs);
+
     /**
     * @brief Low level generate to be called with already encoded input_ids tokens.
     * Streamer cannot be used for multibatch inputs.
