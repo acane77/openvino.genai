@@ -157,12 +157,8 @@ ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner
                                                 ov::genai::GenerationConfig config,
                                                 std::shared_ptr<ov::genai::StreamerBase> streamer,
                                                 std::optional<ov::Tensor> position_ids) {
-    //printf("multinomial_decoding.cpp:163\n");
-    //if (input_embeds) {
-        //printf("note: use input_embeds as input\n");
-    //}
     ov::Shape prompts_shape = input_ids.get_shape();
-    const size_t batch_size = prompts_shape[0];
+    size_t batch_size = prompts_shape[0];
 
     OPENVINO_ASSERT(batch_size == 1, "Only batch size = 1 supported for multinomial decoding");
 
@@ -195,19 +191,14 @@ ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner
     
     if (position_ids.has_value())
         m_model_runner.set_tensor("position_ids", *position_ids);
-
-    //printf("position_ids.type: %d\n", position_ids->get_element_type());
     
     // Input values are persistent between inference calls.
     // That allows to set values, which aren't going to change, only once
     m_model_runner.get_tensor("beam_idx").set_shape({batch_size});
     m_model_runner.get_tensor("beam_idx").data<int32_t>()[0] = 0;
-    //printf("multinomial_decoding.cpp:207 after set beam_idx tensor shape and data\n");
 
     const auto infer_start = std::chrono::steady_clock::now();
-    //printf("multinomial_decoding.cpp:211 before infer\n");
     m_model_runner.infer();
-    //printf("multinomial_decoding.cpp:213 after infer\n");
     const auto infer_end = std::chrono::steady_clock::now();
     const auto infer_ms = PerfMetrics::get_microsec(infer_end - infer_start);
     raw_perf_counters.m_inference_durations[0] += MicroSeconds(infer_ms);
@@ -215,31 +206,25 @@ ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner
     raw_perf_counters.m_new_token_times.emplace_back(infer_end);
     raw_perf_counters.m_batch_sizes.emplace_back(batch_size);
 
-    //printf("multinomial_decoding.cpp:223 before get_tensor logits\n");
     auto logits_tensor = m_model_runner.get_tensor("logits");
-    //printf("multinomial_decoding.cpp:225 after get_tensor logits, type is %d\n", logits_tensor.get_element_type());
 
     int64_t sequence_offset = logits_tensor.get_shape().at(1) - 1;
     size_t vocab_size = logits_tensor.get_shape().back();
 
-    //printf("multinomial_decoding.cpp:230\n");
     float* logits = logits_tensor.data<float>() + sequence_offset * vocab_size;
 
     const int64_t* input_ids_data = input_ids.data<const int64_t>();
 
-    //printf("multinomial_decoding.cpp:235\n");
     std::vector<int64_t> tokens{input_ids_data, input_ids_data + input_ids.get_size()};
 
     RandomSampling sampling{config};
 
-    //printf("multinomial_decoding.cpp:240\n");
     TokenIdScore out_token = sampling.get_out_token(logits, vocab_size, tokens);
 
     tokens.push_back(out_token.id);
     results.tokens[0].push_back(out_token.id);
     results.scores[0] += out_token.score;
 
-    //printf("multinomial_decoding.cpp:247\n");
     if (streamer && streamer->put(out_token.id)) {
         return results;
     }
@@ -256,9 +241,7 @@ ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner
         m_model_runner.get_tensor("inputs_embeds").set_shape({batch_size, 1, input_embeds->get_shape()[2]});
     }
 
-    //printf("multinomial_decoding.cpp:249\n");
     for (size_t i = 0; i < max_new_tokens - 1; i++) {
-        //printf("multinomial_decoding.cpp:251, i=%zd\n", i);
         if (position_ids.has_value()) {
             ov::genai::utils::update_position_ids(m_model_runner.get_tensor("position_ids"),
                                                   m_model_runner.get_tensor("attention_mask"));
@@ -320,5 +303,51 @@ ov::genai::EncodedResults multinominal_decoding(ov::InferRequest& m_model_runner
 
     return results;
 }
+
+ov::genai::EncodedResults prefill(ov::InferRequest& m_model_runner,
+                                  ov::Tensor input_ids,
+                                  const ov::Tensor* input_embeds,
+                                  ov::Tensor attention_mask,
+                                  std::optional<ov::Tensor> position_ids) {
+    ov::Shape prompts_shape = input_ids.get_shape();
+    size_t batch_size = prompts_shape[0];
+    OPENVINO_ASSERT(batch_size == 1, "Only batch size = 1 supported for prefill");
+    const size_t prompt_len = prompts_shape[1];
+
+    // Initialize results and performance metrics.
+    EncodedResults results;
+    auto& raw_perf_counters = results.perf_metrics.raw_metrics;
+    results.scores.clear();
+    results.tokens.clear();
+
+    // Initialize inputs
+    if (input_embeds == nullptr) {
+        // printf("multinomial_decoding.cpp:187 before set input_ids\n");
+        m_model_runner.set_tensor("input_ids", input_ids);
+    }
+    else {
+        // printf("multinomial_decoding.cpp:193 before set inputs_embeds, elem_type is %d\n",
+        //     input_embeds->get_element_type());
+        m_model_runner.set_tensor("inputs_embeds", *input_embeds);
+    }
+
+    // printf("multinomial_decoding.cpp:187 before set attention_mask tensor, elem_type is %d\n",
+    //     attention_mask.get_element_type());
+    m_model_runner.set_tensor("attention_mask", attention_mask);
+
+    if (position_ids.has_value())
+        m_model_runner.set_tensor("position_ids", *position_ids);
+
+    // Input values are persistent between inference calls.
+    // That allows to set values, which aren't going to change, only once
+    m_model_runner.get_tensor("beam_idx").set_shape({batch_size});
+    m_model_runner.get_tensor("beam_idx").data<int32_t>()[0] = 0;
+    m_model_runner.infer();
+    raw_perf_counters.m_new_token_times.emplace_back(std::chrono::steady_clock::now());
+    raw_perf_counters.m_batch_sizes.emplace_back(batch_size);
+
+    return results;
+}
+
 }  // namespace genai
 }  // namespace ov

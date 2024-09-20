@@ -65,6 +65,13 @@ std::pair<EncodedResults, int32_t> beam_search(
     std::optional<int32_t> selected_beam_idx
 );
 
+ov::genai::EncodedResults prefill(
+    ov::InferRequest& m_model_runner,
+    ov::Tensor input_ids,
+    const ov::Tensor* input_embeds,
+    ov::Tensor attention_mask,
+    std::optional<ov::Tensor> position_ids);
+
 class StatefulLLMPipeline final : public LLMPipelineImplBase {
 public:
     ov::InferRequest m_model_runner;
@@ -107,7 +114,7 @@ public:
         const std::string& device, 
         const ov::AnyMap& plugin_config
     ): StatefulLLMPipeline{model_path, Tokenizer(model_path.string()), device, plugin_config} {}
-    
+
     DecodedResults generate(
         StringInputs inputs,
         OptionalGenerationConfig generation_config,
@@ -177,6 +184,94 @@ public:
         decoded_results.perf_metrics.m_evaluated = false;
         decoded_results.perf_metrics.evaluate_statistics(start_time);
         return decoded_results;
+    }
+
+    EncodedResults prefill(const EncodedInputs& inputs) override {
+        auto start_time = std::chrono::steady_clock::now();
+        ov::Tensor input_ids;
+        std::unique_ptr<ov::Tensor> input_embeds = nullptr;
+        ov::Tensor attention_mask;
+        if (auto data = std::get_if<ov::Tensor>(&inputs)) {
+            input_ids = *data;
+            attention_mask = ov::genai::utils::init_attention_mask(*data);
+        } else if (auto data = std::get_if<TokenizedInputs>(&inputs)) {
+            input_ids = data->input_ids;
+            attention_mask = data->attention_mask;
+        }
+        else if (auto data = std::get_if<TokenizedEmbeddedInputs>(&inputs)) {
+            //printf(">>> input as TokenizedEmbeddedInputs\n");
+            input_ids = data->input_ids;
+            attention_mask = data->attention_mask;
+            input_embeds = std::make_unique<ov::Tensor>(data->input_embeds);
+            auto input_ids_shape = input_ids.get_shape();
+            auto input_embeds_shape = input_embeds->get_shape();
+            if (input_ids_shape.size() != input_embeds_shape.size() - 1) {
+                OPENVINO_THROW("unexpected id and embedding pair, id shape is ", input_ids_shape.size(),
+                    " embedding shape is ", input_embeds_shape.size());
+            }
+            for (int i=0; i<input_ids_shape.size(); i++) {
+                if (input_ids_shape[i] != input_embeds_shape[i]) {
+                    OPENVINO_THROW("size on dimension ", i, " does not match, id:", input_ids_shape[i], " embedding:", input_embeds_shape[i]);
+                }
+            }
+        }
+        auto batch_size = input_ids.get_shape().at(0);
+        if (batch_size != 1) {
+            OPENVINO_THROW("Currently prefill is possible only with batch size=1");
+        }
+        auto num_inputs = m_model_runner.get_compiled_model().inputs().size();
+        OPENVINO_ASSERT(num_inputs == 4 || num_inputs == 3, "Model should have 3 or 4 inputs: "
+                        "either (input_ids, attention_mask, beam_idx) or "
+                        "(input_ids, attention_mask, position_ids, beam_idx) "
+                        "but you have '" + std::to_string(num_inputs) + "' inputs");
+        size_t kv_cache_len = 0;
+        ov::Tensor concatenated_attention_mask;
+        if (is_chat_conversation && !m_is_cache_empty) {
+            OPENVINO_ASSERT(batch_size == 1, "continuation of generation is possible only for batch 1");
+            // If history is saved in KV cache, concatenate new attention_mask with the already existing.
+            // Between subsequent runs attention_mask should not be modified.
+            auto atten_mask_history = m_model_runner.get_tensor("attention_mask");
+            auto prompt_len = attention_mask.get_shape()[1];
+            kv_cache_len = atten_mask_history.get_shape()[1];
+
+            ov::Tensor new_atten_mask = ov::Tensor{ov::element::i64, {batch_size, kv_cache_len + prompt_len}};
+            auto start_atten_hst = atten_mask_history.data<int64_t>() + kv_cache_len * (*m_selected_beam);
+            std::copy(start_atten_hst, start_atten_hst + kv_cache_len,
+                    new_atten_mask.data<int64_t>());
+            std::copy(attention_mask.data<int64_t>(), attention_mask.data<int64_t>() + prompt_len,
+                    new_atten_mask.data<int64_t>() + kv_cache_len);
+            concatenated_attention_mask = new_atten_mask;
+        } else {
+            concatenated_attention_mask = attention_mask;
+        }
+        bool position_ids_available = (num_inputs == 4);
+        std::optional<ov::Tensor> position_ids = std::nullopt;
+        if (position_ids_available) {
+            position_ids = ov::Tensor{ov::element::i64, input_ids.get_shape()};
+            utils::initialize_position_ids(*position_ids, attention_mask, kv_cache_len);
+        }
+        ov::genai::prefill(m_model_runner, input_ids, input_embeds.get(),
+                           concatenated_attention_mask, position_ids);
+        if (!is_chat_conversation) {
+            m_model_runner.reset_state();
+            m_selected_beam = std::nullopt;
+        } else {
+            m_is_cache_empty = false;
+        }
+        auto stop_time = std::chrono::steady_clock::now();
+        ov::genai::EncodedResults result;
+        // If is called without tokenization then that stat will not be reported.
+        auto& metrics = result.perf_metrics;
+        if (input_embeds == nullptr) {
+            metrics.num_input_tokens = batch_size * input_ids.get_shape().at(1);
+        }
+        else {
+            metrics.num_input_tokens = batch_size * input_embeds->get_shape().at(1);
+        }
+        metrics.load_time = this->m_load_time_ms;
+        metrics.raw_metrics.generate_durations.emplace_back(PerfMetrics::get_microsec(stop_time - start_time));
+        // metrics.evaluate_statistics(start_time);
+        return result;
     }
 
     EncodedResults generate(
@@ -343,6 +438,10 @@ public:
         }
     }
 };
+
+EncodedResults LLMPipeline::prefill(const EncodedInputs& inputs) {
+    return m_pimpl->prefill(inputs);
+}
 
 DecodedResults LLMPipeline::generate(
         StringInputs inputs,
