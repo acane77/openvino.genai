@@ -3,13 +3,15 @@
 
 #include "openvino/genai/perf_metrics.hpp"
 #include "utils.hpp"
+#include "openvino/genai/embedding_streamer.hpp"
 
 namespace ov {
 namespace genai {
 
 EncodedResults greedy_decoding(
     ov::InferRequest& m_model_runner, 
-    ov::Tensor input_ids, 
+    ov::Tensor input_ids,
+    const ov::Tensor* input_embeds,
     ov::Tensor attention_mask, 
     const ov::genai::GenerationConfig generation_config, 
     const std::shared_ptr<StreamerBase> streamer,
@@ -29,7 +31,15 @@ EncodedResults greedy_decoding(
     results.tokens.resize(running_batch_size);
     std::fill(results.scores.begin(), results.scores.end(), 0);
 
-    m_model_runner.set_tensor("input_ids", input_ids);
+    if (input_embeds == nullptr) {
+        // printf("greedy_decoding before set input_ids\n");
+        m_model_runner.set_tensor("input_ids", input_ids);
+    }
+    else {
+        // printf("greedy_decoding before set inputs_embeds, elem_type is %d\n",
+        //     input_embeds->get_element_type());
+        m_model_runner.set_tensor("inputs_embeds", *input_embeds);
+    }
     m_model_runner.set_tensor("attention_mask", attention_mask);
     if (position_ids.has_value())
         m_model_runner.set_tensor("position_ids", *position_ids);
@@ -42,7 +52,13 @@ EncodedResults greedy_decoding(
     auto logits = m_model_runner.get_tensor("logits");
     ov::Shape logits_shape = logits.get_shape();
     size_t seq_len = logits_shape[1], vocab_size = logits_shape[2];
-    m_model_runner.get_tensor("input_ids").set_shape({running_batch_size, 1});
+
+    if (input_embeds == nullptr) {
+        m_model_runner.get_tensor("input_ids").set_shape({running_batch_size, 1});
+    }
+    else {
+        m_model_runner.get_tensor("inputs_embeds").set_shape({running_batch_size, 1, input_embeds->get_shape()[2]});
+    }
 
     std::vector<int64_t> token_iter_results(running_batch_size);  // results of a single infer request
     std::vector<int> eos_met(running_batch_size, 0);  // use int because can not use std::all_of with vector<bool>
@@ -52,7 +68,29 @@ EncodedResults greedy_decoding(
 
         token_iter_results[batch] = out_token;
         eos_met[batch] = (out_token == generation_config.eos_token_id);
-        m_model_runner.get_tensor("input_ids").data<int64_t>()[batch] = out_token;
+
+        if (input_embeds == nullptr) {
+            m_model_runner.get_tensor("input_ids").data<int64_t>()[batch] = out_token;
+        }
+        else {
+            auto input_emb_data_type = input_embeds->get_element_type();
+            auto input_emb_shape = input_embeds->get_shape();
+            size_t data_size = input_emb_data_type.size() * input_emb_shape[2];
+            void* interm_input_emb_data = m_model_runner.get_tensor("inputs_embeds").data<float>() + batch * input_emb_shape[2];
+            std::shared_ptr<EmbeddingStreamer> embedding_streamer = std::dynamic_pointer_cast<EmbeddingStreamer>(streamer);
+            if (embedding_streamer == nullptr) {
+                OPENVINO_THROW("for input_embeds as input, must use EmbeddingStreamer as stream");
+            }
+            //printf("---> get embedding start, token = %ld\n", out_token.id);
+            ov::Tensor out_tok_embedding = embedding_streamer->get_embedding(out_token);
+            //printf("---> get embedding end, token = %ld, |embedding| = %zd\n",
+            //    out_token.id, out_tok_embedding.get_size());
+            if (out_tok_embedding.get_size() != input_emb_shape[2]) {
+                OPENVINO_THROW("embedding data size is not expected.  "
+                               "real:", out_tok_embedding.get_size(), "  expected:", input_emb_shape[2]);
+            }
+            memcpy(interm_input_emb_data, out_tok_embedding.data(), data_size);
+        }
     }
     raw_perf_counters.m_new_token_times.emplace_back(std::chrono::steady_clock::now());
     raw_perf_counters.m_batch_sizes.emplace_back(batch_size);
@@ -85,7 +123,28 @@ EncodedResults greedy_decoding(
             token_iter_results[batch] = out_token;
             eos_met[batch] = (out_token == generation_config.eos_token_id);
             
-            m_model_runner.get_tensor("input_ids").data<int64_t>()[batch] = out_token;
+            if (input_embeds == nullptr) {
+                m_model_runner.get_tensor("input_ids").data<int64_t>()[batch] = out_token;
+            }
+            else {
+                auto input_emb_data_type = input_embeds->get_element_type();
+                auto input_emb_shape = input_embeds->get_shape();
+                size_t data_size = input_emb_data_type.size() * input_emb_shape[2];
+                void* interm_input_emb_data = m_model_runner.get_tensor("inputs_embeds").data<float>() + batch * input_emb_shape[2];
+                std::shared_ptr<EmbeddingStreamer> embedding_streamer = std::dynamic_pointer_cast<EmbeddingStreamer>(streamer);
+                if (embedding_streamer == nullptr) {
+                    OPENVINO_THROW("for input_embeds as input, must use EmbeddingStreamer as stream");
+                }
+                //printf("---> get embedding start, token = %ld\n", out_token.id);
+                ov::Tensor out_tok_embedding = embedding_streamer->get_embedding(out_token);
+                //printf("---> get embedding end, token = %ld, |embedding| = %zd\n",
+                //    out_token.id, out_tok_embedding.get_size());
+                if (out_tok_embedding.get_size() != input_emb_shape[2]) {
+                    OPENVINO_THROW("embedding data size is not expected.  "
+                                   "real:", out_tok_embedding.get_size(), "  expected:", input_emb_shape[2]);
+                }
+                memcpy(interm_input_emb_data, out_tok_embedding.data(), data_size);
+            }
         }
         raw_perf_counters.m_new_token_times.emplace_back(std::chrono::steady_clock::now());
         raw_perf_counters.m_batch_sizes.emplace_back(batch_size);
