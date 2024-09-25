@@ -40,6 +40,7 @@ namespace genai {
 ov::genai::EncodedResults greedy_decoding(
     ov::InferRequest& model_runner,
     ov::Tensor prompts,
+    const ov::Tensor* input_embeds,
     ov::Tensor attention_mask,
     const GenerationConfig sampling_params,
     const std::shared_ptr<StreamerBase> streamer,
@@ -369,12 +370,12 @@ public:
 
         ov::genai::EncodedResults result;
         if (config.is_greedy_decoding()) {
-            OPENVINO_ASSERT(input_ids, "Only support input_ids as input tensor for now");
-            result = ov::genai::greedy_decoding(m_model_runner, input_ids, concatenated_attention_mask,
+            result = ov::genai::greedy_decoding(m_model_runner, input_ids, input_embeds.get(),
+                                                concatenated_attention_mask,
                                                 config, streamer_ptr, position_ids);
             m_selected_beam = 0;
         } else if (config.is_beam_search()) {
-            OPENVINO_ASSERT(input_ids, "Only support input_ids as input tensor for now");
+            OPENVINO_ASSERT(input_embeds == nullptr, "Only support input_ids as input tensor for now");
             std::tie(result, m_selected_beam) = beam_search(m_model_runner, input_ids, concatenated_attention_mask,
                                                             config, position_ids, m_selected_beam);
         } else if (config.is_multinomial()) {
