@@ -258,6 +258,7 @@ public:
             m_selected_beam = std::nullopt;
         } else {
             m_is_cache_empty = false;
+            m_selected_beam = 0;
         }
         auto stop_time = std::chrono::steady_clock::now();
         ov::genai::EncodedResults result;
