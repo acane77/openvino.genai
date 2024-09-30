@@ -23,7 +23,7 @@ bool TextCallbackStreamer::put(int64_t token) {
         return on_finalized_subword_callback(res.str());
     }
 
-    if (text.size() >= 3 && text.compare(text.size() - 3, 3, "�") == 0) {
+    if (text.size() >= 3 && text.compare(text.size() - 3, 3, "\xef\xbf\xbd") == 0) {
         // Don't print incomplete text
         return on_finalized_subword_callback(res.str());
     } else if (text.size() > print_len) {
